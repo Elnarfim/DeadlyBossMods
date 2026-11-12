@@ -73,11 +73,10 @@ end
 
 function module:CheckZone()
 	local _, nativeType, difficultyId, _, _, _, _, mapId = GetInstanceInfo()
-	local contentType
-	if private.isForever then
+	local contentType = difficulties:InstanceType(mapId)
+	--Try to fill it in if it's still missing from data (InstanceType returns 0, not nil, when missing)
+	if contentType == 0 then
 		contentType = nativeType == "party" and 2 or nativeType == "raid" and 3 or 0
-	else
-		contentType = difficulties:InstanceType(mapId)
 	end
 	if mapId ~= instanceId or difficultyId ~= difficulty or contentType ~= instanceType then
 		self:Deactivate()
@@ -182,7 +181,7 @@ local function resolveFilter(isLieutenant, isNonElite)
 end
 
 function module:HandleCast(unit, spellID, channel, castBarID, succeeded, retried)
-	if not registered or not DBM:IsEnabled() or not DBM.Options.Enabled then return end
+	if not registered or not DBM:IsEnabled() then return end
 	local permission = bossPermission()
 	if not eligible(permission) then
 		self:Deactivate()
