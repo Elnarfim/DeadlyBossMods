@@ -22,9 +22,16 @@ local difficulty, instanceId, instanceType = 0, 0, 0
 local optionPrefix
 local optionPrefixes = {[2] = "GenericTrashDungeon", [3] = "GenericTrashRaid", [4] = "GenericTrashDelve"}
 local zoneChecks, retries, previous = {}, {}, {}
+local lastTargetTime, lastTargetKind, lastTargetUnit
+-- Forever: per-token START/CHANNEL state (true while casting, GetTime() when it stopped) and SUCCEEDED times.
+local castStates, succeededTimes
 
 local function debugCast(unit, reason)
 	DBM:Debug("GenericTrash " .. unit .. ": " .. reason, 3, nil, nil, true, true)
+end
+
+local function debugUnit(unit)
+	return private.isForever and DBM.Options.DebugMode and (unit == "target" or unit == "softenemy")
 end
 
 local function cancelTimers(timers)
@@ -68,7 +75,7 @@ end
 
 function module:Deactivate()
 	if registered then
-		if DBM.Options.DebugMode then
+		if private.isForever and DBM.Options.DebugMode then
 			DBM:Debug("GenericTrash: unregistering cast events", 3, nil, nil, true, true)
 		end
 		self:UnregisterShortTermEvents()
@@ -76,6 +83,8 @@ function module:Deactivate()
 	end
 	cancelTimers(retries)
 	table.wipe(previous)
+	lastTargetTime = nil
+	castStates, succeededTimes = nil, nil
 end
 
 function module:CheckZone()
@@ -105,8 +114,16 @@ function module:CheckZone()
 			"NAME_PLATE_UNIT_ADDED",
 			"NAME_PLATE_UNIT_REMOVED"
 		)
+		if private.isForever then
+			self:RegisterShortTermEvents(
+				"UNIT_SPELLCAST_STOP_UNFILTERED",
+				"UNIT_SPELLCAST_INTERRUPTED_UNFILTERED",
+				"UNIT_SPELLCAST_CHANNEL_STOP_UNFILTERED",
+				"PLAYER_SOFT_ENEMY_CHANGED"
+			)
+		end
 		registered = true
-		if DBM.Options.DebugMode then
+		if private.isForever and DBM.Options.DebugMode then
 			DBM:Debug("GenericTrash: registering cast events (" .. optionPrefix .. ")", 3, nil, nil, true, true)
 		end
 	end
@@ -117,6 +134,8 @@ function DBM:UpdateGenericTrashOptions(resetEncounter)
 	if resetEncounter then
 		cancelTimers(retries)
 		table.wipe(previous)
+		lastTargetTime = nil
+		castStates, succeededTimes = nil, nil
 	end
 	module:CheckZone()
 end
@@ -166,12 +185,18 @@ function module:NAME_PLATE_UNIT_REMOVED(unit)
 			retries[timer] = nil
 		end
 	end
+	if castStates then castStates[unit] = nil end
+	if succeededTimes then succeededTimes[unit] = nil end
 end
 
 module.NAME_PLATE_UNIT_ADDED = module.NAME_PLATE_UNIT_REMOVED
 
 function module:PLAYER_TARGET_CHANGED()
 	self:NAME_PLATE_UNIT_REMOVED("target")
+end
+
+function module:PLAYER_SOFT_ENEMY_CHANGED()
+	self:NAME_PLATE_UNIT_REMOVED("softenemy")
 end
 
 local function resolveFilter(isLieutenant, isNonElite)
@@ -191,7 +216,7 @@ local function resolveFilter(isLieutenant, isNonElite)
 end
 
 function module:HandleCast(unit, spellID, channel, castBarID, succeeded, retried)
-	local debug = DBM.Options.DebugMode
+	local debug = debugUnit(unit)
 	if debug then
 		debugCast(unit, (succeeded and "succeeded" or channel and "channel" or "cast") .. (retried and " retry received" or " received"))
 	end
@@ -215,7 +240,8 @@ function module:HandleCast(unit, spellID, channel, castBarID, succeeded, retried
 		return
 	end
 	-- Event unit tokens are public; spell/cast identities may be opaque.
-	if succeeded and (DBM:issecretvalue(castBarID) or (castBarID ~= nil and castBarID ~= false)) then
+	-- During enrolled Forever bosses, SUCCEEDED events reaching here with a cast bar had no START/CHANNEL on this token.
+	if succeeded and (DBM:issecretvalue(castBarID) or (not (private.isForever and permission == true) and castBarID ~= nil and castBarID ~= false)) then
 		if debug then debugCast(unit, "rejected: succeeded event has a cast bar ID") end
 		return
 	end
@@ -224,7 +250,7 @@ function module:HandleCast(unit, spellID, channel, castBarID, succeeded, retried
 	local isLieutenant
 	if private.isForever then
 		local level = UnitLevel(unit)
-		--Filter alerts for mobs that are 10 or more levels less than player, to avoid spam when farming low level dungeons
+		--Filter alerts for mobs that are 15 or more levels less than player, to avoid spam when farming low level dungeons
 		if level ~= -1 and level <= private.playerLevel - 15 then
 			if debug then debugCast(unit, "rejected: unit level too low") end
 			return
@@ -254,13 +280,15 @@ function module:HandleCast(unit, spellID, channel, castBarID, succeeded, retried
 		if debug then debugCast(unit, "rejected: unit filter off") end
 		return
 	end
+	-- Unfiltered cast events report a soft-targeted unit as softenemy instead of target/nameplate.
+	local softEnemy = unit == "softenemy"
 	if not (permission == true and unit:find("^boss%d+$")) then
 		if filter == "target" then
-			if unit ~= "target" then
+			if unit ~= "target" and not (softEnemy and UnitIsUnit("target", unit)) then
 				if debug then debugCast(unit, "rejected: target-only unit filter") end
 				return
 			end
-		elseif not unit:find("^nameplate") then
+		elseif not softEnemy and not unit:find("^nameplate") then
 			if debug then debugCast(unit, "rejected: nameplate-only unit filter") end
 			return
 		end
@@ -303,6 +331,15 @@ function module:HandleCast(unit, spellID, channel, castBarID, succeeded, retried
 		duration = DBM.DefaultOptions[durationKey]
 	end
 	local now = GetTime()
+	local castKind = succeeded and "succeeded" or channel and "channel" or "cast"
+	if unitIsTarget then
+		-- The target may also arrive as softenemy; suppress the second token's report of the same cast.
+		if lastTargetTime == now and lastTargetKind == castKind and lastTargetUnit ~= unit then
+			if debug then debugCast(unit, "rejected: duplicate target token") end
+			return
+		end
+		lastTargetTime, lastTargetKind, lastTargetUnit = now, castKind, unit
+	end
 	local shouldAlert = unitIsTarget or now - (previous[category] or -math.huge) > duration
 	if not shouldAlert and DBM.Options[optionPrefix .. "ThrottleType"] ~= "sounds" then
 		if debug then debugCast(unit, "rejected: message throttle") end
@@ -317,14 +354,54 @@ function module:HandleCast(unit, spellID, channel, castBarID, succeeded, retried
 	if debug then debugCast(unit, "warning dispatch completed") end
 end
 
-function module:UNIT_SPELLCAST_START_UNFILTERED(unit, _, spellID)
-	self:HandleCast(unit, spellID, false)
+-- Forever cast-bar IDs are not stable identities; correlate a cast's events by token and receipt frame instead.
+-- Returns true when a START/CHANNEL reports a cast whose SUCCEEDED already arrived this frame.
+local function beginCast(unit)
+	local now = GetTime()
+	castStates = castStates or {}
+	castStates[unit] = true
+	if succeededTimes and succeededTimes[unit] == now then
+		if debugUnit(unit) then debugCast(unit, "rejected: start follows same-frame succeeded") end
+		return true
+	end
+end
+
+local function endCast(unit)
+	if castStates and castStates[unit] == true then
+		castStates[unit] = GetTime()
+	end
+end
+
+function module:UNIT_SPELLCAST_START_UNFILTERED(unit, _, spellID, castBarID)
+	if private.isForever and beginCast(unit) then return end
+	self:HandleCast(unit, spellID, false, castBarID)
 end
 
 function module:UNIT_SPELLCAST_SUCCEEDED_UNFILTERED(unit, _, spellID, castBarID)
+	-- Bosses rarely change tokens mid-cast; trash target swaps would split a cast across tokens.
+	if private.isForever and not DBM:issecretvalue(castBarID) and castBarID ~= nil and castBarID ~= false and bossPermission() == true then
+		local now = GetTime()
+		local state = castStates and castStates[unit]
+		-- STOP can precede SUCCEEDED in the same frame when a cast completes.
+		if state == true or state == now then
+			castStates[unit] = nil
+			if debugUnit(unit) then debugCast(unit, "rejected: succeeded completes a reported cast") end
+			return
+		end
+		succeededTimes = succeededTimes or {}
+		succeededTimes[unit] = now
+	end
 	self:HandleCast(unit, spellID, false, castBarID, true)
 end
 
-function module:UNIT_SPELLCAST_CHANNEL_START_UNFILTERED(unit, _, spellID)
-	self:HandleCast(unit, spellID, true)
+function module:UNIT_SPELLCAST_CHANNEL_START_UNFILTERED(unit, _, spellID, castBarID)
+	if private.isForever and beginCast(unit) then return end
+	self:HandleCast(unit, spellID, true, castBarID)
 end
+
+function module:UNIT_SPELLCAST_STOP_UNFILTERED(unit)
+	endCast(unit)
+end
+
+module.UNIT_SPELLCAST_INTERRUPTED_UNFILTERED = module.UNIT_SPELLCAST_STOP_UNFILTERED
+module.UNIT_SPELLCAST_CHANNEL_STOP_UNFILTERED = module.UNIT_SPELLCAST_STOP_UNFILTERED
